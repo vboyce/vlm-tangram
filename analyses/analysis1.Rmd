@@ -1,0 +1,852 @@
+---
+title: "First pass"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+---
+
+
+
+# Thoughts for later
+
+* ? try more comparable to tg-matcher in presenting full-ish transcripts?
+* should we retrain on not these tangrams, only others? (is there a pre-trained model that achieves this?)
+* ? should we split the utterances somehow and look at fit of words/phrases (i.e. to feed to CHAI? or do drop out analysis or ....)
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(viridis)
+library(Replicate)
+library(metafor)
+library(esc)
+library(here)
+library(brms)
+library(rstan)
+library(googledrive)
+library(glmnet)
+library(tidybayes)
+library(ggstance)
+library("lattice")
+library(reshape2)
+library(ggrepel)
+library(ggthemes)
+library(knitr)
+library(cowplot)
+library(ggtext)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(ggtext)
+
+theme_set(theme_bw())
+
+images <- "images"
+
+prediction_loc <- "model_predictions"
+dat_loc <- "other_data"
+```
+
+```{r}
+# let's try reading them in from github? since they're in another repo
+
+# based on https://github.com/vboyce/multiparty-tangrams/blob/main/code/prep_ms.R
+
+url <- "https://raw.githubusercontent.com/vboyce/multiparty-tangrams/main/"
+one_chat <- read_csv(str_c(url, "data/study1/filtered_chat.csv")) |> mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_chat <- read_csv(str_c(url, "data/study2a/filtered_chat.csv")) |> mutate(rotate = "no_rotate")
+two_b_chat <- read_csv(str_c(url, "data/study2b/filtered_chat.csv")) |>
+  mutate(rotate = "full_feedback") |>
+  select(-`row num`)
+two_c_chat <- read_csv(str_c(url, "data/study2c/filtered_chat.csv")) |>
+  mutate(rotate = "emoji") |>
+  select(-type)
+three_chat <- read_csv(str_c(url, "data/study3/filtered_chat.csv")) |>
+  inner_join(read_rds(str_c(url, "data/study3/round_results.rds")) |> select(gameId, trialNum, condition = name) |> unique()) |>
+  select(-rowid, -type)
+
+combined_chat <- one_chat |>
+  rbind(two_a_chat) |>
+  rbind(two_b_chat) |>
+  rbind(two_c_chat) |>
+  mutate(activePlayerCount = NA) |>
+  rename(condition = rotate) |>
+  rbind(three_chat) |>
+  filter(!(is.chitchat)) |>
+  mutate(
+    text = gsub("\\n", "", fixed = T, spellchecked), # note that this is using spellcorrected version!!!!
+    text = gsub("[/?/.]", " ", text),
+    text = str_squish(text),
+    tangram = gsub("/experiment/tangram_", "", target, fixed = TRUE),
+    tangram = gsub(".png", "", tangram, fixed = TRUE)
+  ) %>%
+  select(gameId, trialNum, repNum, tangram, playerId, role, numPlayers, text, condition)
+# so here we instead count non-white space chunks for words
+```
+
+
+
+```{r}
+ft_model <- read_csv(here(prediction_loc, "finetuned_model.csv")) |> left_join(combined_chat)
+
+pt_base <- read_csv(here(prediction_loc, "pretrain_clip_base.csv")) |> left_join(combined_chat)
+
+pt_large <- read_csv(here(prediction_loc, "pretrain_clip_large.csv")) |> left_join(combined_chat)
+```
+
+# Analyses of just CLIP results
+
+We have results from 3 models
+
+* the best performing of the fine tuned on kilgram models
+* a base clip model (no finetuning)
+* a large clip model (no finetuning)
+
+## Of highest likelihood option
+
+How often is the highest likelihood label the correct one?
+
+```{r}
+color_scheme <- c(
+  "2_rotate" = "#FFBDD4", "5_rotate" = "#A12EFF", "3_rotate" = "#FF7DF0", "6_rotate" = "#6940FF", "4_rotate" = "#D24AFF", "full_feedback" = "#425df5", "no_rotate" = "#00A2FF", "emoji" = "#D47E04", "2_thin" = "#FFDA09", "6_thin" = "#D47E04",
+  "2_thick" = "#77F3DB", "6_thick" = "#00BDA8"
+)
+
+ft_model |>
+  mutate(correct = prediction == label) |>
+  mutate(expt = case_when(
+    condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+    str_detect(condition, "rotate") ~ 1,
+    T ~ 3
+  )) |>
+  group_by(condition, repNum, expt) |>
+  summarize(model_correct = mean(correct)) |>
+  ggplot(aes(x = repNum, y = model_correct, color = condition)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~expt) +
+  scale_color_manual(values = color_scheme) +
+  coord_cartesian(ylim = c(0, 1), expand = F) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted")+labs(title="Fine tuned model")
+
+
+```
+25-40% range, intriguing potential patterns, but could be noise?
+
+```{r}
+
+pt_base |>
+  mutate(correct = prediction == label) |>
+  mutate(expt = case_when(
+    condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+    str_detect(condition, "rotate") ~ 1,
+    T ~ 3
+  )) |>
+  group_by(condition, repNum, expt) |>
+  summarize(model_correct = mean(correct)) |>
+  ggplot(aes(x = repNum, y = model_correct, color = condition)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~expt) +
+  scale_color_manual(values = color_scheme) +
+  coord_cartesian(ylim = c(0, 1), expand = F) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted")+labs(title="PT base model")
+
+
+
+```
+
+```{r}
+pt_large |>
+  mutate(correct = prediction == label) |>
+  mutate(expt = case_when(
+    condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+    str_detect(condition, "rotate") ~ 1,
+    T ~ 3
+  )) |>
+  group_by(condition, repNum, expt) |>
+  summarize(model_correct = mean(correct)) |>
+  ggplot(aes(x = repNum, y = model_correct, color = condition)) +
+  geom_point() +
+  geom_line() +
+  facet_wrap(~expt) +
+  scale_color_manual(values = color_scheme) +
+  coord_cartesian(ylim = c(0, 1), expand = F) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted")+labs(title="PT large model")
+```
+
+## Highest likelihood by tangram
+
+Split by tangram. 
+
+We know that tangrams vary in codeability. 
+
+```{r}
+labels <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L") |> map(~ str_c("<img src=", here(images, str_c("tangram_", ., ".png")), " width='20'/>"))
+
+label <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
+```
+
+```{r}
+
+
+by_tangram <- ft_model |>
+  mutate(correct = prediction == label) |>
+  group_by(label, repNum) |>
+  summarize(model_correct = mean(correct))
+
+foo <- tibble(label, labels) |>
+  left_join(by_tangram) |>
+  group_by(label, labels) |>
+  summarize(m = mean(model_correct)) |>
+  arrange(m)
+
+by_tangram |> ggplot(aes(x = reorder(label, model_correct), y = model_correct, color = as.factor(repNum))) +
+  geom_point() +
+  scale_color_viridis(discrete = T) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  theme(axis.text.x = element_markdown(color = "black", size = 11))+labs(title="Fine tuned model")
+```
+
+Tangrams vary widely in model performance; also vary in what round the model is best at. 
+
+```{r}
+
+
+by_tangram <- pt_base |>
+  mutate(correct = prediction == label) |>
+  group_by(label, repNum) |>
+  summarize(model_correct = mean(correct))
+
+foo <- tibble(label, labels) |>
+  left_join(by_tangram) |>
+  group_by(label, labels) |>
+  summarize(m = mean(model_correct)) |>
+  arrange(m)
+
+by_tangram |> ggplot(aes(x = reorder(label, model_correct), y = model_correct, color = as.factor(repNum))) +
+  geom_point() +
+  scale_color_viridis(discrete = T) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  theme(axis.text.x = element_markdown(color = "black", size = 11))+labs(title="PT base model")
+```
+
+```{r}
+
+
+by_tangram <- pt_large |>
+  mutate(correct = prediction == label) |>
+  group_by(label, repNum) |>
+  summarize(model_correct = mean(correct))
+
+foo <- tibble(label, labels) |>
+  left_join(by_tangram) |>
+  group_by(label, labels) |>
+  summarize(m = mean(model_correct)) |>
+  arrange(m)
+
+by_tangram |> ggplot(aes(x = reorder(label, model_correct), y = model_correct, color = as.factor(repNum))) +
+  geom_point() +
+  scale_color_viridis(discrete = T) +
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  theme(axis.text.x = element_markdown(color = "black", size = 11))+labs(title="PT large model")
+```
+
+## By probability assigned
+
+Alternative is to look at how much probability the correct answer got.
+
+This mostly tracks the above, which makes sense. 
+
+```{r}
+by_probability <- ft_model |>
+  pivot_longer(p_A:p_L, names_to = "image", values_to = "prob") |>
+  filter(str_c("p_", label) == image)
+
+
+by_probability |>
+  mutate(correct = prediction == label) |>
+  mutate(expt = case_when(
+    condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+    str_detect(condition, "rotate") ~ 1,
+    T ~ 3
+  )) |>
+  ggplot(aes(x = repNum, y = prob, color = condition)) +
+  stat_summary(fun.data = "mean_cl_boot") +
+  stat_summary(fun.data = "mean_cl_boot", geom = "line") +
+  facet_wrap(~expt) +
+  scale_color_manual(values = color_scheme) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted")+labs(title="Fine Tuned model")
+
+
+mean_prob <- by_probability |>
+  group_by(label) |>
+  summarize(m = mean(prob))
+
+foo <- tibble(label, labels) |>
+  left_join(mean_prob) |>
+  arrange(m)
+
+by_probability |> ggplot(aes(x = reorder(label, prob), y = prob, color = as.factor(repNum))) +
+  stat_summary(aes(group = repNum), fun.data = "mean_cl_boot") +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  scale_color_viridis(discrete = T) +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  theme(axis.text.x = element_markdown(color = "black", size = 11))+labs(title="Fine Tuned model")
+```
+
+
+```{r}
+by_probability <- pt_base |>
+  pivot_longer(p_A:p_L, names_to = "image", values_to = "prob") |>
+  filter(str_c("p_", label) == image)
+
+
+by_probability |>
+  mutate(correct = prediction == label) |>
+  mutate(expt = case_when(
+    condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+    str_detect(condition, "rotate") ~ 1,
+    T ~ 3
+  )) |>
+  ggplot(aes(x = repNum, y = prob, color = condition)) +
+  stat_summary(fun.data = "mean_cl_boot") +
+  stat_summary(fun.data = "mean_cl_boot", geom = "line") +
+  facet_wrap(~expt) +
+  scale_color_manual(values = color_scheme) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted")+labs(title="PT base model")
+
+
+mean_prob <- by_probability |>
+  group_by(label) |>
+  summarize(m = mean(prob))
+
+foo <- tibble(label, labels) |>
+  left_join(mean_prob) |>
+  arrange(m)
+
+by_probability |> ggplot(aes(x = reorder(label, prob), y = prob, color = as.factor(repNum))) +
+  stat_summary(aes(group = repNum), fun.data = "mean_cl_boot") +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  scale_color_viridis(discrete = T) +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  theme(axis.text.x = element_markdown(color = "black", size = 11))+labs(title="PT base model")
+```
+
+
+```{r}
+by_probability <- pt_large |>
+  pivot_longer(p_A:p_L, names_to = "image", values_to = "prob") |>
+  filter(str_c("p_", label) == image)
+
+
+by_probability |>
+  mutate(correct = prediction == label) |>
+  mutate(expt = case_when(
+    condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+    str_detect(condition, "rotate") ~ 1,
+    T ~ 3
+  )) |>
+  ggplot(aes(x = repNum, y = prob, color = condition)) +
+  stat_summary(fun.data = "mean_cl_boot") +
+  stat_summary(fun.data = "mean_cl_boot", geom = "line") +
+  facet_wrap(~expt) +
+  scale_color_manual(values = color_scheme) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted")+labs(title="pre-trained Large model")
+
+
+mean_prob <- by_probability |>
+  group_by(label) |>
+  summarize(m = mean(prob))
+
+foo <- tibble(label, labels) |>
+  left_join(mean_prob) |>
+  arrange(m)
+
+by_probability |> ggplot(aes(x = reorder(label, prob), y = prob, color = as.factor(repNum))) +
+  stat_summary(aes(group = repNum), fun.data = "mean_cl_boot") +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  scale_color_viridis(discrete = T) +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  theme(axis.text.x = element_markdown(color = "black", size = 11))+labs(title="pre-trained Large model")
+```
+
+## Confusion matrices
+
+Of top option. 
+
+```{r}
+
+confusion <- ft_model |>
+  group_by(label, prediction) |>
+  tally() |>
+  group_by(label) |>
+  mutate(pct = n / sum(n))
+
+self <- confusion |>
+  filter(label == prediction) |>
+  select(label, self = pct)
+
+corr_order <- tibble(label, labels) |>
+  left_join(self) |>
+  arrange(self)
+
+self_2 <- confusion |>
+  ungroup() |>
+  filter(label == prediction) |>
+  select(prediction, self_2 = pct)
+
+
+confusion |>
+  left_join(self) |>
+  left_join(self_2) |>
+  ggplot(aes(x = reorder(label, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = pct)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_x_discrete(name = "Correct", labels = corr_order$labels) +
+  scale_y_discrete(name = "Model label", labels = corr_order$labels) +
+  theme(axis.text = element_markdown(color = "black", size = 11))+labs(title="Fine tuned")
+```
+
+```{r}
+
+confusion <- pt_base |>
+  group_by(label, prediction) |>
+  tally() |>
+  group_by(label) |>
+  mutate(pct = n / sum(n))
+
+self <- confusion |>
+  filter(label == prediction) |>
+  select(label, self = pct)
+
+corr_order <- tibble(label, labels) |>
+  left_join(self) |>
+  arrange(self)
+
+self_2 <- confusion |>
+  ungroup() |>
+  filter(label == prediction) |>
+  select(prediction, self_2 = pct)
+
+
+confusion |>
+  left_join(self) |>
+  left_join(self_2) |>
+  ggplot(aes(x = reorder(label, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = pct)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_x_discrete(name = "Correct", labels = corr_order$labels) +
+  scale_y_discrete(name = "Model label", labels = corr_order$labels) +
+  theme(axis.text = element_markdown(color = "black", size = 11))+labs(title="PT base")
+```
+
+```{r}
+
+confusion <- pt_large |>
+  group_by(label, prediction) |>
+  tally() |>
+  group_by(label) |>
+  mutate(pct = n / sum(n))
+
+self <- confusion |>
+  filter(label == prediction) |>
+  select(label, self = pct)
+
+corr_order <- tibble(label, labels) |>
+  left_join(self) |>
+  arrange(self)
+
+self_2 <- confusion |>
+  ungroup() |>
+  filter(label == prediction) |>
+  select(prediction, self_2 = pct)
+
+
+confusion |>
+  left_join(self) |>
+  left_join(self_2) |>
+  ggplot(aes(x = reorder(label, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = pct)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_x_discrete(name = "Correct", labels = corr_order$labels) +
+  scale_y_discrete(name = "Model label", labels = corr_order$labels) +
+  theme(axis.text = element_markdown(color = "black", size = 11))+labs(title="PT large")
+```
+
+Of probability mass. 
+
+```{r}
+
+confusion <- ft_model |>
+  pivot_longer(p_A:p_L, names_to = "image", values_to = "prob") |>
+  mutate(prediction = str_sub(image, -1)) |>
+  group_by(label, prediction) |>
+  summarize(prob = mean(prob))
+
+self <- confusion |>
+  filter(label == prediction) |>
+  select(label, self = prob)
+
+corr_order <- tibble(label, labels) |>
+  left_join(self) |>
+  arrange(self)
+
+self_2 <- confusion |>
+  ungroup() |>
+  filter(label == prediction) |>
+  select(prediction, self_2 = prob)
+
+
+confusion |>
+  left_join(self) |>
+  left_join(self_2) |>
+  ggplot(aes(x = reorder(label, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = prob)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_x_discrete(name = "Correct", labels = corr_order$labels) +
+  scale_y_discrete(name = "Model option", labels = corr_order$labels) +
+  theme(axis.text = element_markdown(color = "black", size = 11))+labs(title="FT model")
+```
+
+```{r}
+
+confusion <- pt_base |>
+  pivot_longer(p_A:p_L, names_to = "image", values_to = "prob") |>
+  mutate(prediction = str_sub(image, -1)) |>
+  group_by(label, prediction) |>
+  summarize(prob = mean(prob))
+
+self <- confusion |>
+  filter(label == prediction) |>
+  select(label, self = prob)
+
+corr_order <- tibble(label, labels) |>
+  left_join(self) |>
+  arrange(self)
+
+self_2 <- confusion |>
+  ungroup() |>
+  filter(label == prediction) |>
+  select(prediction, self_2 = prob)
+
+
+confusion |>
+  left_join(self) |>
+  left_join(self_2) |>
+  ggplot(aes(x = reorder(label, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = prob)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_x_discrete(name = "Correct", labels = corr_order$labels) +
+  scale_y_discrete(name = "Model option", labels = corr_order$labels) +
+  theme(axis.text = element_markdown(color = "black", size = 11))+labs(title="PT base model")
+```
+
+```{r}
+
+confusion <- pt_large |>
+  pivot_longer(p_A:p_L, names_to = "image", values_to = "prob") |>
+  mutate(prediction = str_sub(image, -1)) |>
+  group_by(label, prediction) |>
+  summarize(prob = mean(prob))
+
+self <- confusion |>
+  filter(label == prediction) |>
+  select(label, self = prob)
+
+corr_order <- tibble(label, labels) |>
+  left_join(self) |>
+  arrange(self)
+
+self_2 <- confusion |>
+  ungroup() |>
+  filter(label == prediction) |>
+  select(prediction, self_2 = prob)
+
+
+confusion |>
+  left_join(self) |>
+  left_join(self_2) |>
+  ggplot(aes(x = reorder(label, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = prob)) +
+  geom_tile() +
+  scale_fill_gradient(low = "white", high = "blue") +
+  scale_x_discrete(name = "Correct", labels = corr_order$labels) +
+  scale_y_discrete(name = "Model option", labels = corr_order$labels) +
+  theme(axis.text = element_markdown(color = "black", size = 11))+labs(title="PT large model")
+```
+
+# Compare error patterns among CLIP models
+
+
+```{r}
+models <- ft_model |> mutate(model="ft") |> bind_rows(pt_base |> mutate(model="pt_base")) |> bind_rows(pt_large |> mutate(model="pt_large")) |> mutate(correct=label==prediction)
+
+
+grouped <- models |> group_by(model, repNum, condition, tangram, label) |> summarize(model_correct=mean(correct))
+
+foo <- tibble(label, labels) |>
+  left_join(grouped) |>
+  group_by(label, labels) |>
+  summarize(m = mean(model_correct)) |>
+  arrange(m)
+
+grouped |> ggplot(aes(x = reorder(label, model_correct), y = model_correct, color = model, group=model)) +
+  geom_point(position=position_dodge(width=.5), alpha=.2, color="grey") +
+  stat_summary(fun.data="mean_cl_boot", position=position_dodge(width=.5))+
+  coord_cartesian(ylim = c(0, 1)) +
+  geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  theme(axis.text.x = element_markdown(color = "black", size = 11))
+```
+
+
+```{r}
+wide <- models |> select(model, correct, gameId, tangram, repNum, utterance, playerId, condition, text) |> pivot_wider(names_from=model, values_from=correct) |> unnest(ft, pt_base, pt_large) |> 
+  mutate(across(ft:pt_large, ~ifelse(., 1,0)))
+
+cor.test(wide$ft, wide$pt_base)
+cor.test(wide$ft, wide$pt_large)
+cor.test(wide$pt_base, wide$pt_large)
+
+```
+# Compare with tg-matcher results 
+(Always comparing to FT model)
+Basically, we want to know how the model qualitatively compares to humans -- i.e. is there alignment on what the harder / easier ones are. 
+
+Could look at this various ways, but the cleanest comparison is that we have naive human guessing data. 
+
+```{r}
+human <- read_csv(here(dat_loc,"human_data.csv"))
+
+d_subset <- ft_model |>
+  filter(repNum %in% c(0, 5)) |>
+  filter(condition %in% c("2_rotate", "6_rotate", "2_thin", "6_thin", "2_thick", "6_thick"))
+```
+
+```{r}
+human_summary <- human |>
+  group_by(tangram = correct_tangram, condition, round) |>
+  summarize(correct = mean(correct)) |>
+  mutate(source = "human")
+
+model_summary <- d_subset |>
+  mutate(round = str_c("round_", as.character(repNum + 1))) |>
+  mutate(correct = tangram == prediction) |>
+  group_by(tangram, condition, round) |>
+  summarize(correct = mean(correct)) |>
+  mutate(source = "model")
+
+both <- human_summary |> bind_rows(model_summary)
+
+foo <- tibble(tangram = label, labels) |>
+  left_join(both) |>
+  group_by(tangram, labels) |>
+  summarize(acc = mean(correct)) |>
+  arrange(acc)
+
+ggplot(both, aes(x = reorder(tangram, correct), y = correct, group = source, color = source)) +
+  geom_point(position = position_dodge(width = .3)) +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  theme(axis.text = element_markdown(color = "black", size = 11))
+```
+
+Each point is one of the 12 condition (round 1/6 x 2/6 person x rotate/thin/thick)
+
+The model is very bad at ice skater? 
+
+```{r}
+human_summary |>
+  select(-source) |>
+  rename(Human = correct) |>
+  left_join(model_summary |> select(-source) |> rename(Model = correct)) |>
+  ggplot(aes(x = Human, y = Model, color = tangram)) +
+  geom_point() +
+  geom_smooth(aes(group = 1), method = "lm") +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  geom_abline()
+```
+
+This is slightly unfair in some ways since they might be seeing different subsets. 
+
+
+Model sees on a *per utterance* basis, humans see on a per transcript basis. It may in future make sense to show the model something more like what the people see if comparison is what we care about. 
+
+## Taking only the first utterance
+
+Assume first utterance is most contentful, and later ones may be more addressing questions or adding details. 
+
+```{r}
+model_first_utt <- d_subset |>
+  group_by(gameId, trialNum) |>
+  mutate(blah = row_number()) |>
+  filter(blah == 1) |>
+  ungroup()
+
+model_summary_first <- model_first_utt |>
+  mutate(round = str_c("round_", as.character(repNum + 1))) |>
+  mutate(correct = tangram == prediction) |>
+  group_by(tangram, condition, round) |>
+  summarize(correct = mean(correct)) |>
+  mutate(source = "model")
+
+
+both <- human_summary |> bind_rows(model_summary_first)
+
+foo <- tibble(tangram = label, labels) |>
+  left_join(both) |>
+  group_by(tangram, labels) |>
+  summarize(acc = mean(correct)) |>
+  arrange(acc)
+
+ggplot(both, aes(x = reorder(tangram, correct), y = correct, group = source, color = source)) +
+  geom_point(position = position_dodge(width = .3)) +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  theme(axis.text = element_markdown(color = "black", size = 11))
+```
+
+## Taking only singleton utterances
+
+This has less data especially in some conditions, but is the most comparable. 
+
+```{r}
+model_solo_utt <- d_subset |>
+  group_by(gameId, trialNum) |>
+  summarize(n = n()) |>
+  filter(n == 1) |>
+  inner_join(d_subset)
+
+human_acc <- human |>
+  group_by(gameId, round, condition, tangram = correct_tangram) |>
+  summarize(human_correct = mean(correct))
+
+joined_first <- model_first_utt |>
+  mutate(round = str_c("round_", as.character(repNum + 1))) |>
+  inner_join(human_acc)
+
+joined_solo <- model_solo_utt |>
+  mutate(round = str_c("round_", as.character(repNum + 1))) |>
+  inner_join(human_acc)
+```
+
+```{r}
+joined_solo |>
+  group_by(condition, round) |>
+  tally()
+
+long_solo <- joined_solo |>
+  group_by(tangram, condition, round) |>
+  summarize(human = mean(human_correct), model = mean(prediction == label)) |>
+  pivot_longer(human:model, names_to = "source", values_to = "acc")
+
+foo <- tibble(tangram = label, labels) |>
+  left_join(long_solo) |>
+  group_by(tangram, labels) |>
+  summarize(acc = mean(acc)) |>
+  arrange(acc)
+
+ggplot(long_solo, aes(x = reorder(tangram, acc), y = acc, group = source, color = source)) +
+  geom_point(position = position_dodge(width = .3)) +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  theme(axis.text = element_markdown(color = "black", size = 11))
+```
+
+# Comparions with mpt accuracies
+
+Again, only using FT model. 
+
+```{r}
+url <- "https://raw.githubusercontent.com/vboyce/multiparty-tangrams/main/"
+
+one_round_results <- read_rds(str_c(url, "data/study1/round_results.rds")) %>% mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_round_results <- read_rds(str_c(url, "data/study2a/round_results.rds")) %>% mutate(rotate = "no_rotate")
+two_b_round_results <- read_rds(str_c(url, "data/study2b/round_results.rds")) %>% mutate(rotate = "full_feedback")
+two_c_round_results <- read_rds(str_c(url, "data/study2c/round_results.rds")) |> mutate(rotate = "emoji")
+three_round_results <- read_rds(str_c(url, "data/study3/round_results.rds")) |> rename(`_id` = "X_id", condition = name)
+
+combined_results <- one_round_results |>
+  rbind(two_a_round_results) |>
+  rbind(two_b_round_results) |>
+  rbind(two_c_round_results) |>
+  mutate(activePlayerCount = NA) |>
+  rename(condition = rotate) |>
+  rbind(three_round_results) |>
+  select(realCorrect, gameId, targetNum, repNum, trialNum, condition, numPlayers, activePlayerCount, tangram) |>
+  mutate(activePlayerCount = ifelse(is.na(activePlayerCount), numPlayers, activePlayerCount),
+         acc=realCorrect/(activePlayerCount-1))|> 
+  unique() 
+
+```
+
+```{r}
+model_summ <- ft_model |> mutate(correct=label==prediction) |> group_by(repNum, condition, tangram) |> summarize(model=mean(correct))
+human_summary <- combined_results |> group_by(repNum, condition, tangram) |> summarize(human=mean(acc))
+```
+
+```{r}
+human_summary |> left_join(model_summ) |> ggplot( aes(x=human, y=model, color=tangram))+geom_point()+facet_wrap(~repNum)+geom_abline()+geom_smooth(aes(group=1),method="lm")
+
+
+combined <- human_summary |> rename(acc=human) |> mutate(source="human") |> bind_rows(model_summ |> rename(acc=model) |> mutate(source="model"))
+
+foo <- tibble(tangram = label, labels) |>
+  left_join(combined) |>
+  group_by(tangram, labels) |>
+  summarize(acc = mean(acc)) |>
+  arrange(acc)
+
+ggplot(combined, aes(x = reorder(tangram, acc), y = acc, group = source, color = source)) +
+  geom_point(position = position_dodge(width = .3), alpha=.1) +
+    stat_summary(fun.data="mean_cl_boot", position = position_dodge(width = .3), color="black") +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+  geom_hline(yintercept=1/12, lintype="dotted")+
+  theme(axis.text = element_markdown(color = "black", size = 11))
+```
+Same caveats as previous comparison with people apply. The model's error pattern does not seem particularly correlated with the human error pattern. 
+
+Could consider doing within-tangram analyses for utterance by utterance or something? 
+
+
+# Comparison with kilogram naming divergence
+
+(only using FT model)
+* part naming divergence (PND): "PND is computed identically to SND, but with the concatenation of all part names of an annotation as the input text"
+
+* Shape Naming Divergence (SND):  "A tangram’s SND quantifies the variability among whole-shape annotations. SND is an operationalization of nameability,"
+
+* part segmentation agreement (PSA): "PSA quantifies the agreement between part segmentations as the maximum number of pieces that does not need to be"
+
+```{r}
+library(tidyjson)
+library(ggimage)
+
+kilogram <- read_json(here(dat_loc,"kilogram_dense.json")) |>
+  gather_object() |>
+  filter(str_sub(name, -1) %in% c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")) |>
+  spread_all() |>
+  ungroup() |> 
+  mutate(tangram = str_sub(name, -1)) |>
+  mutate(image=here(images, str_c("tangram_", tangram, ".png"))) |> 
+  select(tangram, snd, pnd, psa, image) |> as.tibble()
+
+both |> left_join(kilogram) |> 
+ggplot(aes(x=snd, y=correct))+geom_point(aes(color=source))+labs(x="Shape Naming Divergence")+
+  geom_image(data=kilogram, aes(image=image, y=1))+geom_smooth(aes(color=source), method="lm")
+```
+
+```{r}
+both |> left_join(kilogram) |> ggplot(aes(x=pnd, y=correct))+geom_point(aes(color=source))+labs(x="Part Naming Divergence")+  geom_image(data=kilogram, aes(image=image, y=1))+geom_smooth(aes(color=source), method="lm")
+
+```
