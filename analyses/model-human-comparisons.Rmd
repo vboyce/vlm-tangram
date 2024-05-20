@@ -1,0 +1,169 @@
+---
+title: "Model-human comparisons"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"), fig.width=10, fig.height=4)
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(viridis)
+library(Replicate)
+library(metafor)
+library(esc)
+library(here)
+library(brms)
+library(rstan)
+library(googledrive)
+library(glmnet)
+library(tidybayes)
+library(ggstance)
+library("lattice")
+library(reshape2)
+library(ggrepel)
+library(ggthemes)
+library(knitr)
+library(cowplot)
+library(ggtext)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(ggtext)
+
+theme_set(theme_bw())
+
+images <- "images"
+
+prediction_loc <- "model_predictions"
+dat_loc <- "other_data"
+
+human <- read_csv(here(dat_loc,"human_data.csv"))
+
+```
+
+```{r, message=F}
+# let's try reading them in from github? since they're in another repo
+
+# based on https://github.com/vboyce/multiparty-tangrams/blob/main/code/prep_ms.R
+
+url <- "https://raw.githubusercontent.com/vboyce/multiparty-tangrams/main/"
+one_chat <- read_csv(str_c(url, "data/study1/filtered_chat.csv")) |> mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_chat <- read_csv(str_c(url, "data/study2a/filtered_chat.csv")) |> mutate(rotate = "no_rotate")
+two_b_chat <- read_csv(str_c(url, "data/study2b/filtered_chat.csv")) |>
+  mutate(rotate = "full_feedback") |>
+  select(-`row num`)
+two_c_chat <- read_csv(str_c(url, "data/study2c/filtered_chat.csv")) |>
+  mutate(rotate = "emoji") |>
+  select(-type)
+three_chat <- read_csv(str_c(url, "data/study3/filtered_chat.csv")) |>
+  inner_join(read_rds(str_c(url, "data/study3/round_results.rds")) |> select(gameId, trialNum, condition = name) |> unique()) |>
+  select(-rowid, -type)
+
+combined_chat <- one_chat |>
+  rbind(two_a_chat) |>
+  rbind(two_b_chat) |>
+  rbind(two_c_chat) |>
+  mutate(activePlayerCount = NA) |>
+  rename(condition = rotate) |>
+  rbind(three_chat) |>
+  filter(!(is.chitchat)) |>
+  mutate(
+    text = gsub("\\n", "", fixed = T, spellchecked), # note that this is using spellcorrected version!!!!
+    text = gsub("[/?/.]", " ", text),
+    text = str_squish(text),
+    tangram = gsub("/experiment/tangram_", "", target, fixed = TRUE),
+    tangram = gsub(".png", "", tangram, fixed = TRUE)
+  ) %>%
+  select(gameId, trialNum, repNum, tangram, playerId, role, numPlayers, text, condition)
+# so here we instead count non-white space chunks for words
+```
+
+```{r}
+labels <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L") |> map(~ str_c("<img src=", here(images, str_c("tangram_", ., ".png")), " width='20'/>"))
+
+label <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
+
+human_order <- human |> rename(tangram=correct_tangram) |> group_by(tangram) |> summarize(correct=mean(correct)) |> arrange(correct)
+
+foo <- tibble(tangram = label, labels) |>
+  left_join(human_order) |>
+  arrange(correct)
+
+tangram_levels <- human_order$tangram
+
+
+```
+
+# All tg-matcher
+
+Compare the model results (on individual speaker description ?) with human results from the whole dialogue. 
+```{r}
+
+run_stuff <- function(model_path, title){
+
+  d_subset <- read_csv(here(prediction_loc, model_path)) |> 
+    left_join(combined_chat) |> 
+    filter(repNum %in% c(0, 5)) |>
+  filter(condition %in% c("2_rotate", "6_rotate", "2_thin", "6_thin", "2_thick", "6_thick"))
+  
+human_summary <- human |>
+  group_by(tangram = correct_tangram, condition, round) |>
+  summarize(correct = mean(correct)) |>
+  mutate(source = "human")
+
+model_summary <- d_subset |>
+  mutate(round = str_c("round_", as.character(repNum + 1))) |>
+  mutate(correct = tangram == prediction) |>
+  group_by(tangram, condition, round) |>
+  summarize(correct = mean(correct)) |>
+  mutate(source = "model")
+
+both <- human_summary |> bind_rows(model_summary) |> 
+  mutate(tangram=factor(tangram, levels=tangram_levels))
+
+one <- ggplot(both, aes(x = tangram, y = correct, group = source, color = source)) +
+  geom_point(position = position_dodge(width = .3)) +
+  scale_x_discrete(name = NULL, labels = foo$labels) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+  theme(axis.text = element_markdown(color = "black", size = 11))+
+  theme(legend.position = "none")+
+  labs(title=title)
+
+both_wide <-human_summary |>
+  select(-source) |>
+  rename(Human = correct) |>
+  left_join(model_summary |> select(-source) |> rename(Model = correct)) 
+
+two <- both_wide |> 
+  ggplot(aes(x = Human, y = Model, color = tangram)) +
+  geom_point() +
+  geom_smooth(aes(group = 1), method = "lm") +
+  coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+  geom_abline()+
+  theme(legend.position = "none")
+
+list(plot_grid(one,two, rel_widths = c(1.5,1)), str_c("Correlation between ",title, " model and human ", round(cor(both_wide$Human, both_wide$Model),3)))
+}
+```
+
+
+```{r, message=F}
+run_stuff("ft_control_augment.csv", "Control - augment")
+run_stuff("ft_control_parts_color.csv", "Control - parts - color")
+run_stuff("ft_control_whole_black.csv", "Control - whole - black")
+run_stuff("ft_random_augment.csv", "Random - augment")
+run_stuff("ft_random_parts_color.csv", "Random - parts - color")
+run_stuff("ft_random_whole_black.csv", "Random - whole - black")
+
+```
+
+
+
+
+# Next steps
+Model sees on a *per utterance* basis, humans see on a per transcript basis. It may in future make sense to show the model something more like what the people see if comparison is what we care about. 
