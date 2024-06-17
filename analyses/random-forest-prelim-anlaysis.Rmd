@@ -1,0 +1,530 @@
+---
+title: "Random forest prelim analysis"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"), fig.width = 10, fig.height = 4)
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(viridis)
+library(Replicate)
+library(metafor)
+library(esc)
+library(here)
+library(brms)
+library(rstan)
+library(googledrive)
+library(glmnet)
+library(tidybayes)
+library(ggstance)
+library("lattice")
+library(reshape2)
+library(ggrepel)
+library(ggthemes)
+library(knitr)
+library(cowplot)
+library(ggtext)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(ggtext)
+
+theme_set(theme_bw())
+
+images <- "images"
+
+prediction_loc <- "model_predictions"
+dat_loc <- "other_data"
+
+human <- read_csv(here(dat_loc, "human_data.csv"))
+```
+
+```{r, message=F}
+# let's try reading them in from github? since they're in another repo
+
+# based on https://github.com/vboyce/multiparty-tangrams/blob/main/code/prep_ms.R
+
+url <- "https://raw.githubusercontent.com/vboyce/multiparty-tangrams/main/"
+one_chat <- read_csv(str_c(url, "data/study1/filtered_chat.csv")) |> mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_chat <- read_csv(str_c(url, "data/study2a/filtered_chat.csv")) |> mutate(rotate = "no_rotate")
+two_b_chat <- read_csv(str_c(url, "data/study2b/filtered_chat.csv")) |>
+  mutate(rotate = "full_feedback") |>
+  select(-`row num`)
+two_c_chat <- read_csv(str_c(url, "data/study2c/filtered_chat.csv")) |>
+  mutate(rotate = "emoji") |>
+  select(-type)
+three_chat <- read_csv(str_c(url, "data/study3/filtered_chat.csv")) |>
+  inner_join(read_rds(str_c(url, "data/study3/round_results.rds")) |> select(gameId, trialNum, condition = name) |> unique()) |>
+  select(-rowid, -type)
+
+combined_chat <- one_chat |>
+  rbind(two_a_chat) |>
+  rbind(two_b_chat) |>
+  rbind(two_c_chat) |>
+  mutate(activePlayerCount = NA) |>
+  rename(condition = rotate) |>
+  rbind(three_chat) |>
+  filter(!(is.chitchat)) |>
+  mutate(
+    text = gsub("\\n", "", fixed = T, spellchecked), # note that this is using spellcorrected version!!!!
+    text = gsub("[/?/.]", " ", text),
+    text = str_squish(text),
+    tangram = gsub("/experiment/tangram_", "", target, fixed = TRUE),
+    tangram = gsub(".png", "", tangram, fixed = TRUE),
+    words=str_count(text, "\\S+")
+  ) %>%
+  filter(role=="speaker") |> 
+  group_by(gameId, trialNum, repNum, tangram, playerId, numPlayers, condition) |> 
+  summarize(words=sum(words)) |> 
+  select(gameId, trialNum, repNum, tangram, playerId, numPlayers, condition, words) 
+# so here we instead count non-white space chunks for words
+```
+
+```{r}
+url <- "https://raw.githubusercontent.com/vboyce/multiparty-tangrams/main/"
+
+one_round_results <- read_rds(str_c(url, "data/study1/round_results.rds")) %>% mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_round_results <- read_rds(str_c(url, "data/study2a/round_results.rds")) %>% mutate(rotate = "no_rotate")
+two_b_round_results <- read_rds(str_c(url, "data/study2b/round_results.rds")) %>% mutate(rotate = "full_feedback")
+two_c_round_results <- read_rds(str_c(url, "data/study2c/round_results.rds")) |> mutate(rotate = "emoji")
+three_round_results <- read_rds(str_c(url, "data/study3/round_results.rds")) |> rename(`_id` = "X_id", condition = name)
+
+combined_results <- one_round_results |>
+  rbind(two_a_round_results) |>
+  rbind(two_b_round_results) |>
+  rbind(two_c_round_results) |>
+  mutate(activePlayerCount = NA) |>
+  rename(condition = rotate) |>
+  rbind(three_round_results) |>
+  select(realCorrect, gameId, targetNum, repNum, trialNum, condition, numPlayers, activePlayerCount, tangram) |>
+  mutate(
+    activePlayerCount = ifelse(is.na(activePlayerCount), numPlayers, activePlayerCount),
+    acc = realCorrect / (activePlayerCount - 1)
+  ) |>
+  unique()
+```
+
+```{r}
+labels <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L") |> map(~ str_c("<img src=", here(images, str_c("tangram_", ., ".png")), " width='20'/>"))
+
+label <- c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")
+```
+
+```{r}
+rf_mod <- read_csv(here(prediction_loc, "random_forest_stimulus_predictions.csv")) |> rename(prediction = predicted, label = tangram)
+```
+
+# Model Accuracy
+
+```{r}
+color_scheme <- c(
+  "2_rotate" = "#FFBDD4", "5_rotate" = "#A12EFF", "3_rotate" = "#FF7DF0", "6_rotate" = "#6940FF", "4_rotate" = "#D24AFF", "full_feedback" = "#425df5", "no_rotate" = "#00A2FF", "emoji" = "#D47E04", "2_thin" = "#FFDA09", "6_thin" = "#D47E04",
+  "2_thick" = "#77F3DB", "6_thick" = "#00BDA8"
+)
+
+do_accuracy <- function(model, title) {
+  model |>
+    left_join(combined_chat) |>
+    mutate(correct = prediction == label) |>
+    mutate(expt = case_when(
+      condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+      str_detect(condition, "rotate") ~ 1,
+      T ~ 3
+    )) |>
+    group_by(condition, repNum, expt) |>
+    summarize(model_correct = mean(correct)) |>
+    ggplot(aes(x = repNum, y = model_correct, color = condition)) +
+    geom_point() +
+    geom_line() +
+    facet_wrap(~expt) +
+    scale_color_manual(values = color_scheme) +
+    coord_cartesian(ylim = c(0, 1), expand = F) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+    labs(title = title)
+}
+```
+
+## By round & condition 
+
+It increases over repNum, which is ... interesting?!
+
+```{r}
+do_accuracy(rf_mod, "random forest")
+```
+
+```{r}
+do_accuracy_tangram <- function(model, title) {
+  by_tangram <- model |>
+    mutate(correct = prediction == label) |>
+    group_by(label, repNum) |>
+    summarize(model_correct = mean(correct))
+
+  foo <- tibble(label, labels) |>
+    left_join(by_tangram) |>
+    group_by(label, labels) |>
+    summarize(m = mean(model_correct)) |>
+    arrange(m)
+
+  by_tangram |> ggplot(aes(x = reorder(label, model_correct), y = model_correct, color = as.factor(repNum))) +
+    geom_point() +
+    scale_color_viridis(discrete = T) +
+    coord_cartesian(ylim = c(0, 1)) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+    scale_x_discrete(name = NULL, labels = foo$labels) +
+    theme(axis.text.x = element_markdown(color = "black", size = 11)) +
+    labs(title = title)
+}
+```
+
+## By tangram
+
+Above chance at everything! No longer hates the ice skater. 
+
+```{r}
+do_accuracy_tangram(rf_mod, "random forest")
+```
+
+## Accuracy as funct of number of words
+
+```{r}
+
+rf_mod |> left_join(combined_chat) |> 
+  mutate(correct = ifelse(prediction == label,1,0)) |>
+  ggplot(aes(x=words, color=as.factor(repNum)))+geom_density()
+
+rf_mod |> left_join(combined_chat) |> 
+  mutate(correct = ifelse(prediction == label,1,0)) |>
+  ggplot(aes(x=words, color=tangram))+geom_density()
+
+rf_mod |> left_join(combined_chat) |> 
+  mutate(correct = ifelse(prediction == label,1,0)) |>
+  ggplot(aes(x=words, y=correct))+geom_smooth(method="lm", formula=y~log(x))+coord_cartesian(ylim=c(0,1))
+
+rf_mod |> left_join(combined_chat) |> 
+  mutate(correct = ifelse(prediction == label,1,0)) |>
+  ggplot(aes(x=words, y=correct, color=as.factor(repNum)))+geom_smooth(method="lm", formula=y~log(x))+coord_cartesian(ylim=c(0,1))
+
+rf_mod |> left_join(combined_chat) |> 
+  mutate(correct = ifelse(prediction == label,1,0)) |>
+  ggplot(aes(x=words, y=correct, color=tangram))+geom_smooth(method="lm", formula=y~log(x))+coord_cartesian(ylim=c(0,1))
+
+```
+
+## Confusion Matrix
+
+```{r}
+do_confusion <- function(model, title) {
+  confusion <- model |>
+    group_by(label, prediction) |>
+    tally() |>
+    group_by(label) |>
+    mutate(pct = n / sum(n))
+
+  self <- confusion |>
+    filter(label == prediction) |>
+    select(label, self = pct)
+
+  corr_order <- tibble(label, labels) |>
+    left_join(self) |>
+    arrange(self)
+
+  self_2 <- confusion |>
+    ungroup() |>
+    filter(label == prediction) |>
+    select(prediction, self_2 = pct)
+
+
+  confusion |>
+    left_join(self) |>
+    left_join(self_2) |>
+    ggplot(aes(x = reorder(label, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = pct)) +
+    geom_tile() +
+    scale_fill_gradient(low = "white", high = "blue") +
+    scale_x_discrete(name = "Correct", labels = corr_order$labels) +
+    scale_y_discrete(name = "Model label", labels = corr_order$labels) +
+    theme(axis.text = element_markdown(color = "black", size = 11)) +
+    labs(title = title)
+}
+```
+
+```{r}
+do_confusion(rf_mod, "random_forest")
+```
+
+
+# Comparison with all tg-matcher
+
+```{r}
+human_order <- human |>
+  rename(tangram = correct_tangram) |>
+  group_by(tangram) |>
+  summarize(correct = mean(correct)) |>
+  arrange(correct)
+
+foo <- tibble(tangram = label, labels) |>
+  left_join(human_order) |>
+  arrange(correct)
+
+tangram_levels <- human_order$tangram
+```
+
+Compare the random forest  with human results 
+
+```{r}
+run_stuff <- function(model, title) {
+  d_subset <- model |>
+    left_join(combined_chat) |>
+    filter(repNum %in% c(0, 5)) |>
+    filter(condition %in% c("2_rotate", "6_rotate", "2_thin", "6_thin", "2_thick", "6_thick"))
+
+  human_summary <- human |>
+    group_by(tangram = correct_tangram, condition, round) |>
+    summarize(correct = mean(correct)) |>
+    mutate(source = "human")
+
+  model_summary <- d_subset |>
+    mutate(round = str_c("round_", as.character(repNum + 1))) |>
+    mutate(correct = tangram == prediction) |>
+    group_by(tangram, condition, round) |>
+    summarize(correct = mean(correct)) |>
+    mutate(source = "model")
+
+  both <- human_summary |>
+    bind_rows(model_summary) |>
+    mutate(tangram = factor(tangram, levels = tangram_levels))
+
+  one <- ggplot(both, aes(x = tangram, y = correct, group = source, color = source)) +
+    geom_point(position = position_dodge(width = .3)) +
+    scale_x_discrete(name = NULL, labels = foo$labels) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted") +
+    theme(axis.text = element_markdown(color = "black", size = 11)) +
+    theme(legend.position = "bottom") +
+    labs(title = title)
+
+  both_wide <- human_summary |>
+    select(-source) |>
+    rename(Human = correct) |>
+    left_join(model_summary |> select(-source) |> rename(Model = correct))
+
+  two <- both_wide |>
+    ggplot(aes(x = Human, y = Model, color = tangram)) +
+    geom_point() +
+    geom_smooth(aes(group = 1), method = "lm") +
+    coord_equal(xlim = c(0, 1), ylim = c(0, 1)) +
+    geom_abline() +
+    theme(legend.position = "none")
+
+  list(plot_grid(one, two, rel_widths = c(1.5, 1)), str_c("Correlation between ", title, " model and human ", round(cor(both_wide$Human, both_wide$Model), 3)))
+}
+```
+
+
+```{r, message=F}
+run_stuff(rf_mod, "random forest")
+```
+
+
+## Individual correlation
+
+Item level correlation between correct and wrong responses (model & per-human response)
+
+Not sure how to look for correlated error patterns...
+
+```{r}
+
+d_subset <- rf_mod |>
+    left_join(combined_chat) |>
+    filter(repNum %in% c(0, 5)) |>
+    filter(condition %in% c("2_rotate", "6_rotate", "2_thin", "6_thin", "2_thick", "6_thick")) |> 
+      mutate(round = str_c("round_", as.character(repNum + 1))) |>
+    mutate(model_correct = ifelse(tangram == prediction,1,0)) |> 
+  select(gameId, prediction, tangram, condition, round, model_correct) 
+
+
+
+  
+   for_corr <-  human|> select(gameId, selected, human_correct=correct, tangram=correct_tangram, condition, round, group_size, thickness) |> left_join(d_subset) |> filter(!is.na(prediction))
+   
+   cor.test(for_corr$human_correct, for_corr$model_correct)
+   
+   #cor.test(for_corr$selected, for_corr$prediction)
+```
+```{r}
+
+model_hum_confusion <- for_corr |> 
+      group_by(selected, prediction) |>
+    tally() |>
+    group_by(selected) |>
+    mutate(pct = n / sum(n))
+
+  self <- model_hum_confusion |>
+    filter(selected == prediction) |>
+    select(selected, self = pct)
+
+  corr_order <- tibble(label, labels) |>
+    left_join(self |> rename(label=selected)) |>
+    arrange(self)
+
+  self_2 <- model_hum_confusion |>
+    ungroup() |>
+    filter(selected == prediction) |>
+    select(prediction, self_2 = pct)
+
+
+  model_hum_confusion |>
+    left_join(self) |>
+    left_join(self_2) |> 
+    ggplot(aes(x = reorder(selected, self, FUN = mean), y = reorder(prediction, self_2, FUN = mean), fill = pct)) +
+    geom_tile()+
+    scale_fill_gradient(low = "white", high = "blue") +
+    scale_x_discrete(name = "Human label", labels = corr_order$labels) +
+    scale_y_discrete(name = "Model label", labels = corr_order$labels) +
+    theme(axis.text = element_markdown(color = "black", size = 11)) 
+```
+
+## Mid level comparisons
+
+Want to know when model v tg-human is more accurate 
+
+So humans are better at first round, and models are sometimes better at last round -- which is interesting
+
+```{r}
+
+summ <- for_corr |> group_by(group_size,thickness, round, tangram) |> summarize(human_correct=mean(human_correct), model_correct=mean(model_correct)) |> mutate(diff=human_correct-model_correct) |> 
+    mutate(image = str_c("tangram_", tangram, ".png"))
+
+
+ggplot(summ, aes(x=str_c(group_size,"\n",thickness), y=diff, color=round, group=round))+geom_point(position=position_dodge(width=.2))+geom_hline(aes(yintercept=0))+stat_summary(fun.data="mean_cl_boot", color="black", position=position_dodge(width=.2))+
+  labs(y="Human over Model accuracy", x="Condition")
+
+```
+```{r}
+summ |> ggplot(aes(x=human_correct, y=model_correct, color=round))+geom_point()+facet_grid(group_size~thickness)+coord_equal()+geom_abline()
+
+```
+
+# Compare with MPT
+
+Lots of ways to carve this up since we have tangram, round, and conditions...
+
+```{r}
+do_mpt_compare <- function(model, title) {
+  model_summ <- model |> left_join(combined_chat) |> 
+    mutate(correct = label == prediction) |>
+    group_by(repNum, condition, tangram) |>
+    summarize(model = mean(correct))
+
+  human_summary <- combined_results |>
+    group_by(repNum, condition, tangram) |>
+    summarize(human = mean(acc))
+
+  plot_1 <- human_summary |>
+    left_join(model_summ) |>
+    ggplot(aes(x = human, y = model, color = tangram)) +
+    geom_point() +
+    facet_wrap(~repNum) +
+    geom_abline() +
+    geom_smooth(aes(group = 1), method = "lm")
+
+
+  combined <- human_summary |>
+    rename(acc = human) |>
+    mutate(source = "human") |>
+    bind_rows(model_summ |> rename(acc = model) |> mutate(source = "model"))
+
+  foo <- tibble(tangram = label, labels) |>
+    left_join(combined) |>
+    group_by(tangram, labels) |>
+    summarize(acc = mean(acc)) |>
+    arrange(acc)
+
+  plot_2 <- ggplot(combined, aes(x = reorder(tangram, acc), y = acc, group = source, color = source)) +
+    geom_point(position = position_dodge(width = .3), alpha = .1) +
+    stat_summary(fun.data = "mean_cl_boot", position = position_dodge(width = .3), color = "black") +
+    scale_x_discrete(name = NULL, labels = foo$labels) +
+    geom_hline(yintercept = 1 / 12, lintype = "dotted") +
+    theme(axis.text = element_markdown(color = "black", size = 11)) +
+    labs(title = title)
+  
+  list(plot_1, plot_2)
+  }
+```
+
+Model is consistently worse than in-game human, but pretty correlated? 
+
+
+```{r}
+
+do_mpt_compare(rf_mod, "random_forest")
+```
+
+# Comparison with kilogram naming divergence
+
+* part naming divergence (PND): "PND is computed identically to SND, but with the concatenation of all part names of an annotation as the input text"
+
+* Shape Naming Divergence (SND):  "A tangram’s SND quantifies the variability among whole-shape annotations. SND is an operationalization of nameability,"
+
+* part segmentation agreement (PSA): "PSA quantifies the agreement between part segmentations as the maximum number of pieces that does not need to be"
+
+Not sure this is at all meaningful, but tg-matcher accuracies and model accuracies show about the same correlation with this codeability measure ? 
+
+```{r}
+library(tidyjson)
+library(ggimage)
+
+kilogram <- read_json(here(dat_loc,"kilogram_dense.json")) |>
+  gather_object() |>
+  filter(str_sub(name, -1) %in% c("A", "B", "C", "D", "E", "F", "G", "H", "I", "J", "K", "L")) |>
+  spread_all() |>
+  ungroup() |> 
+  mutate(tangram = str_sub(name, -1)) |>
+  mutate(image=here(images, str_c("tangram_", tangram, ".png"))) |> 
+  select(tangram, snd, pnd, psa, image) |> as.tibble()
+
+
+```
+
+```{r}
+
+do_kilogram_compare <- function(model, title){
+  d_subset <- model |>
+    left_join(combined_chat) |>
+    filter(repNum %in% c(0, 5)) |>
+    filter(condition %in% c("2_rotate", "6_rotate", "2_thin", "6_thin", "2_thick", "6_thick"))
+
+  human_summary <- human |>
+    group_by(tangram = correct_tangram, condition, round) |>
+    summarize(correct = mean(correct)) |>
+    mutate(source = "human")
+
+  model_summary <- d_subset |>
+    mutate(round = str_c("round_", as.character(repNum + 1))) |>
+    mutate(correct = tangram == prediction) |>
+    group_by(tangram, condition, round) |>
+    summarize(correct = mean(correct)) |>
+    mutate(source = "model")
+
+  both <- human_summary |>
+    bind_rows(model_summary) |>
+    mutate(tangram = factor(tangram, levels = tangram_levels))
+  
+ plot_1 <-  both |> left_join(kilogram) |> 
+ggplot(aes(x=snd, y=correct))+geom_point(aes(color=source))+labs(x="Shape Naming Divergence")+
+  geom_image(data=kilogram, aes(image=image, y=1))+geom_smooth(aes(color=source), method="lm")
+  
+plot_2 <- both |> left_join(kilogram) |> ggplot(aes(x=pnd, y=correct))+geom_point(aes(color=source))+labs(x="Part Naming Divergence")+  geom_image(data=kilogram, aes(image=image, y=1))+geom_smooth(aes(color=source), method="lm")
+
+list(plot_1, plot_2)
+}
+
+```
+
+```{r}
+do_kilogram_compare(rf_mod, "random forest")
+```
