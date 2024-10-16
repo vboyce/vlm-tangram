@@ -1,0 +1,121 @@
+---
+title: "analysis of the best mlp model"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"), fig.width = 10, fig.height = 4)
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(viridis)
+library(Replicate)
+library(metafor)
+library(esc)
+library(here)
+library(brms)
+library(rstan)
+library(googledrive)
+library(glmnet)
+library(tidybayes)
+library(ggstance)
+library("lattice")
+library(reshape2)
+library(ggrepel)
+library(ggthemes)
+library(knitr)
+library(cowplot)
+library(ggtext)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(ggtext)
+library(ggridges)
+
+theme_set(theme_bw())
+
+images <- "images"
+
+prediction_loc <- "model_predictions"
+dat_loc <- "other_data"
+
+human <- read_csv(here(dat_loc, "human_data.csv")) # tg-matcher data
+
+source(here("analyses/helper.R"))
+
+```
+
+```{r}
+mlp_mod <- read_csv(here(prediction_loc, "mlp_best.csv")) |> pivot_longer(p_A:p_L) |> 
+  group_by(tangram, utterance, gameId, trialNum, repNum, playerId) |> 
+  filter(value == max(value)) |> 
+  mutate(prediction=str_sub(name,3)) |> 
+rename(label = tangram)
+
+```
+
+# Model Accuracy by round and condition 
+
+does seem to go up over time
+
+```{r}
+plot_accuracy(mlp_mod, "mlp best")
+```
+
+## Model accuracy by tangram
+
+look at that above chance accuracy for everything
+
+```{r}
+plot_accuracy_tangram(mlp_mod, "mlp best")
+```
+
+## Accuracy as funct of number of words
+
+
+
+```{r}
+
+combined_chat |>   ggplot(aes(x = words, y = as.factor(repNum), fill = as.factor(repNum))) +
+  geom_density_ridges() +
+  scale_fill_viridis(discrete = T) +
+  labs(y="Round")+
+  theme(legend.position = "none")
+
+plot_accuracy_length(mlp_mod, "mlp best")
+```
+
+## Confusion Matrix
+
+versus truth 
+
+looks reasonable -- confusing the two kneeling-ish ones with each other, the two less feature-y ones
+
+```{r}
+do_confusion(mlp_mod, "mlp best")
+```
+
+
+
+# Comparison with all tg-matcher
+
+decent correlation, model is selectively bad at a couple 
+
+```{r, message=F}
+plot_model_naive_human(mlp_mod, "mlp best")
+```
+
+
+## Individual correlation
+
+Item level correlation between correct and wrong responses (model & per-human response)
+
+
+```{r}
+
+plot_individual_corr(mlp_mod, "mlp best")
+```

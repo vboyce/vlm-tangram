@@ -1,0 +1,126 @@
+---
+title: "First pass"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
+knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(viridis)
+library(Replicate)
+library(metafor)
+library(esc)
+library(here)
+library(brms)
+library(rstan)
+library(googledrive)
+library(glmnet)
+library(tidybayes)
+library(ggstance)
+library("lattice")
+library(reshape2)
+library(ggrepel)
+library(ggthemes)
+library(knitr)
+library(cowplot)
+library(ggtext)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(ggtext)
+
+theme_set(theme_bw())
+
+dat_loc <- "pre_model"
+```
+
+```{r}
+# let's try reading them in from github? since they're in another repo
+
+# based on https://github.com/vboyce/multiparty-tangrams/blob/main/code/prep_ms.R
+
+url <- "https://raw.githubusercontent.com/vboyce/multiparty-tangrams/main/"
+one_chat <- read_csv(str_c(url, "data/study1/filtered_chat.csv")) |> mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_chat <- read_csv(str_c(url, "data/study2a/filtered_chat.csv")) |> mutate(rotate = "no_rotate")
+two_b_chat <- read_csv(str_c(url, "data/study2b/filtered_chat.csv")) |>
+  mutate(rotate = "full_feedback") |>
+  select(-`row num`)
+two_c_chat <- read_csv(str_c(url, "data/study2c/filtered_chat.csv")) |>
+  mutate(rotate = "emoji") |>
+  select(-type)
+three_chat <- read_csv(str_c(url, "data/study3/filtered_chat.csv")) |>
+  inner_join(read_rds(str_c(url, "data/study3/round_results.rds")) |> select(gameId, trialNum, condition = name) |> unique()) |>
+  select(-rowid, -type)
+
+combined_chat <- one_chat |>
+  rbind(two_a_chat) |>
+  rbind(two_b_chat) |>
+  rbind(two_c_chat) |>
+  mutate(activePlayerCount = NA) |>
+  rename(condition = rotate) |>
+  rbind(three_chat) |>
+  filter(!(is.chitchat)) |>
+  mutate(
+    text = gsub("\\n", "", fixed = T, spellchecked), # note that this is using spellcorrected version!!!!
+    text = gsub("[/?/.]", " ", text),
+    text = str_squish(text),
+    tangram = gsub("/experiment/tangram_", "", target, fixed = TRUE),
+    tangram = gsub(".png", "", tangram, fixed = TRUE)
+  ) %>%
+  select(gameId, trialNum, repNum, tangram, playerId, role, numPlayers, text, condition)
+# so here we instead count non-white space chunks for words
+
+one_round_results <- read_rds(str_c(url, "data/study1/round_results.rds")) %>% mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_round_results <- read_rds(str_c(url, "data/study2a/round_results.rds")) %>% mutate(rotate = "no_rotate")
+two_b_round_results <- read_rds(str_c(url, "data/study2b/round_results.rds")) %>% mutate(rotate = "full_feedback")
+two_c_round_results <- read_rds(str_c(url, "data/study2c/round_results.rds")) |> mutate(rotate = "emoji")
+three_round_results <- read_rds(str_c(url, "data/study3/round_results.rds")) |> rename(`_id` = "X_id", condition = name)
+
+combined_results <- one_round_results |>
+  rbind(two_a_round_results) |>
+  rbind(two_b_round_results) |>
+  rbind(two_c_round_results) |>
+  mutate(activePlayerCount = NA) |>
+  rename(condition = rotate) |>
+  rbind(three_round_results) |>
+  select(realCorrect, gameId, targetNum, repNum, trialNum, condition, numPlayers, activePlayerCount) |>
+  unique()
+
+chat <- combined_chat |>
+  left_join(combined_results) |>
+  
+  write_csv(here(dat_loc,"combined_chat.csv"))
+```
+
+# Main prep
+(uhh, that code was somewhere)
+
+# Incremental
+
+```{r}
+incremental <- chat |> filter(role=="speaker") |> select(gameId, trialNum, repNum, tangram, condition, text) |> group_by(gameId, trialNum, repNum, tangram, condition) |> 
+  summarize(text=str_c(text, collapse=" ")) |> 
+  rowwise() |> 
+  mutate(words=str_split(text, pattern="\\s+"), 
+         l=length(words),
+         r=list(seq(1,l,1))) |> 
+  unnest(r) |> 
+  rowwise() |> 
+  mutate(words=list(words[1:r]),
+         partial=words|> str_c(sep=" ", collapse=" ")) |> 
+  select(gameId, trialNum, repNum, tangram, condition, partial_length=r, partial)
+
+text_only <- incremental |> ungroup() |> select(partial) |> unique() |> write_csv(here(dat_loc, "incremental.csv"))
+```
+
+
+
+
+
