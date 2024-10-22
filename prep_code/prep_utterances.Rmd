@@ -115,9 +115,7 @@ incremental <- chat |> filter(role=="speaker") |> select(gameId, trialNum, repNu
   rowwise() |> 
   mutate(words=list(words[1:r]),
          partial=words|> str_c(sep=" ", collapse=" ")) |> 
-  select(gameId, trialNum, repNum, tangram, condition, partial_length=r, partial)
-
-text_only <- incremental |> ungroup() |> select(partial) |> unique() |> write_csv(here(dat_loc, "incremental.csv"))
+  select(gameId, trialNum, repNum, tangram, condition, partial_length=r, partial, text) |>  write_csv(here(dat_loc, "incremental.csv"))
 ```
 
 

@@ -1,0 +1,192 @@
+---
+title: "incremental analysis"
+output:
+  html_document:
+    df_print: paged
+    toc: TRUE
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
+#knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"), fig.width = 10, fig.height = 4)
+options(knitr.table.format = "html")
+knitr::opts_chunk$set(echo = F)
+library(tidyverse)
+library(viridis)
+library(Replicate)
+library(metafor)
+library(esc)
+library(here)
+library(brms)
+library(rstan)
+library(googledrive)
+library(glmnet)
+library(tidybayes)
+library(ggstance)
+library("lattice")
+library(reshape2)
+library(ggrepel)
+library(ggthemes)
+library(knitr)
+library(cowplot)
+library(ggtext)
+rstan_options(auto_write = TRUE)
+options(mc.cores = parallel::detectCores())
+library(ggtext)
+library(ggridges)
+
+theme_set(theme_bw())
+
+images <- "images"
+
+prediction_loc <- "model_predictions"
+dat_loc <- "other_data"
+
+human <- read_csv(here(dat_loc, "human_data.csv")) # tg-matcher data
+
+source(here("analyses/helper.R"))
+```
+
+
+```{r}
+mod_raw <- read_csv(here(prediction_loc, "incremental-probs.csv")) |>
+  rename(partial = utterance) |>
+  left_join(read_csv(here("pre_model/incremental.csv"))) |>
+  select(-raw_logits) |>
+  pivot_longer(p_A:p_L) |>
+  mutate(name = str_sub(name, 3))
+
+mod_pred <- mod_raw |>
+  group_by(tangram, gameId, trialNum, repNum, partial, condition, partial_length, text) |>
+  filter(value == max(value)) |>
+  rename(prediction = name) |>
+  select(-value)
+
+mod_new <- mod_raw |>
+  filter(name == tangram) |>
+  rename(p_correct = value) |>
+  select(-name) |>
+  left_join(mod_pred) |> 
+  mutate(total_len = str_count(text, "\\S+"), frac = partial_length / total_len)
+```
+
+
+
+# Probability assigned to correct answer
+
+## Using absolute length
+
+To deal with length variability, we truncate at 20 words and downfill for utterances shorter than that.
+
+```{r}
+
+mod_truncate <- mod_new |> select(gameId, trialNum, tangram, repNum, condition, text, total_len) |> unique() |> expand_grid(partial_length=1:20) |> left_join(mod_new) |> group_by(gameId, trialNum, tangram, repNum) |> fill(prediction, p_correct, partial)
+
+mod_truncate |> ggplot(aes(x=partial_length, y=p_correct))+
+  stat_summary(fun="mean", aes(group=interaction(repNum, tangram, condition)), col="black", geom="point", alpha=.01)+
+  stat_summary(fun = "mean", aes(group = as.character(repNum), col = as.character(repNum)), geom = "line") +
+  scale_color_viridis(discrete = T)+
+      geom_hline(yintercept = 1 / 12, linetype = "dotted")
+
+```
+
+Choosing a somewhat arbitrary set of word positions (1,5,10) to look at by expt differences. 
+
+```{r}
+mod_truncate |> 
+    mutate(expt = case_when(
+      condition %in% c("emoji", "full_feedback", "no_rotate") ~ 2,
+      str_detect(condition, "rotate") ~ 1,
+      T ~ 3
+    )) |>
+  filter(partial_length %in% c(1,5,10)) |> 
+    group_by(condition, repNum, expt, partial_length) |>
+    summarize(model_correct = mean(p_correct)) |>
+    ggplot(aes(x = repNum, y = model_correct, color = condition)) +
+    geom_point() +
+    geom_line() +
+    facet_grid(expt~partial_length) +
+    scale_color_manual(values = color_scheme) +
+    coord_cartesian(ylim = c(0, .6), expand = F) +
+    geom_hline(yintercept = 1 / 12, linetype = "dotted")
+```
+
+Could use improved vis to add the actual tangram images...
+
+```{r}
+
+mod_truncate |> ggplot(aes(x=partial_length, y=p_correct))+
+  stat_summary(fun = "mean", aes(group = tangram, col = tangram), geom = "line")+
+      geom_hline(yintercept = 1 / 12, linetype = "dotted")
+
+```
+
+## Using fractional length
+
+Rstudio / R is not behaving and so won't show any alpha values less than .002 :(
+
+```{r}
+ggplot(mod_new, aes(x = frac, y = p_correct, color = as.factor(repNum))) +
+  geom_smooth()+
+  scale_color_viridis(discrete=T)+
+      geom_hline(yintercept = 1 / 12, linetype = "dotted")
+
+```
+```{r}
+ggplot(mod_new, aes(x = frac, y = p_correct, color =tangram)) +
+  geom_smooth()+
+      geom_hline(yintercept = 1 / 12, linetype = "dotted")
+
+```
+
+# Delta probs
+
+```{r}
+delta_mod <- mod_new |> group_by(tangram, gameId, trialNum) |> mutate(old=lag(p_correct), delta=p_correct-old)
+
+ggplot(delta_mod |> filter(partial_length<21), aes(x=partial_length, y=delta, color=as.factor(repNum)))+stat_summary(fun="mean", geom="line")+scale_color_viridis(discrete=T)+geom_hline(yintercept=0)
+```
+
+```{r}
+ggplot(delta_mod |> filter(partial_length<21), aes(x=partial_length, y=delta, color=as.factor(tangram)))+stat_summary(fun="mean", geom="line")+geom_hline(yintercept=0)
+```
+
+# Biggest changes
+
+```{r}
+biggest <- delta_mod |> filter(partial_length<21, partial_length>1) |> group_by(tangram, partial_length) |> 
+  arrange(desc(delta)) |> mutate(place=row_number()) |> filter(place<3) |> 
+  select(text, partial, partial_length)
+
+# View(biggest)
+
+kable(biggest |> head(100))
+```
+
+I think final words are > average at diagnostic or content words? 
+
+# Notes
+Plots we want:
+Identifiability vs delta identifiability 
+How identifiable after x fraction or x words (deal with shorter ones appropriately)
+Game condition / repNum / tangram 
+
+
+Model:
+P_correct ~ frac * condition * repNum + (all that | tangram)  + more mixed effects
+Possibly log link function ? 
+Also do this as delta per word??
+Confusion matrix
+GIF is suggested as well as different programming langs
+Maybe bin either by quintile of length or of words (and possibly divide up by repNum)
+What to run on humans 
+What words induce the biggest change in prob dist (see if those make sense via intuition?)
+Biggest KL divergence from one word to the next
+Biggest delta in correct probability
+For overall – sample across prob distribution of model (stratified sampling) then do on humans  (as a human sample – model/human calibration) 
+Could possibly use to adjust these calibration results to make model fit better in future 
+Alvin also wants more model runs for more things just generally 
+Which contexts - words have highest delta (or highest KL) (look at devbench /Alvin for KL divergence) 
+Maybe more substring models? ? 
+Is_retained_in_next_round ~ informativity (from positive/negative rolling window)

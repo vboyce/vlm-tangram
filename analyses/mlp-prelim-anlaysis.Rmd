@@ -87,6 +87,8 @@ combined_chat |>   ggplot(aes(x = words, y = as.factor(repNum), fill = as.factor
   theme(legend.position = "none")
 
 plot_accuracy_length(mlp_mod, "mlp best")
+    
+    
 ```
 
 ## Confusion Matrix
