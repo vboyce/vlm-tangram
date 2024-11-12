@@ -6,35 +6,17 @@ output:
     toc: TRUE
 ---
 
-
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
 knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"))
 options(knitr.table.format = "html")
 knitr::opts_chunk$set(echo = F)
 library(tidyverse)
-library(viridis)
-library(Replicate)
-library(metafor)
-library(esc)
 library(here)
-library(brms)
-library(rstan)
-library(googledrive)
-library(glmnet)
-library(tidybayes)
-library(ggstance)
-library("lattice")
-library(reshape2)
-library(ggrepel)
-library(ggthemes)
-library(knitr)
-library(cowplot)
-library(ggtext)
+library(slider)
+
 rstan_options(auto_write = TRUE)
 options(mc.cores = parallel::detectCores())
-library(ggtext)
 
 theme_set(theme_bw())
 
@@ -47,8 +29,10 @@ dat_loc <- "pre_model"
 # based on https://github.com/vboyce/multiparty-tangrams/blob/main/code/prep_ms.R
 
 url <- "https://raw.githubusercontent.com/vboyce/multiparty-tangrams/main/"
-one_chat <- read_csv(str_c(url, "data/study1/filtered_chat.csv")) |> mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
-two_a_chat <- read_csv(str_c(url, "data/study2a/filtered_chat.csv")) |> mutate(rotate = "no_rotate")
+one_chat <- read_csv(str_c(url, "data/study1/filtered_chat.csv")) |> 
+  mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_chat <- read_csv(str_c(url, "data/study2a/filtered_chat.csv")) |> 
+  mutate(rotate = "no_rotate")
 two_b_chat <- read_csv(str_c(url, "data/study2b/filtered_chat.csv")) |>
   mutate(rotate = "full_feedback") |>
   select(-`row num`)
@@ -56,7 +40,8 @@ two_c_chat <- read_csv(str_c(url, "data/study2c/filtered_chat.csv")) |>
   mutate(rotate = "emoji") |>
   select(-type)
 three_chat <- read_csv(str_c(url, "data/study3/filtered_chat.csv")) |>
-  inner_join(read_rds(str_c(url, "data/study3/round_results.rds")) |> select(gameId, trialNum, condition = name) |> unique()) |>
+  inner_join(read_rds(str_c(url, "data/study3/round_results.rds")) |> 
+               select(gameId, trialNum, condition = name) |> unique()) |>
   select(-rowid, -type)
 
 combined_chat <- one_chat |>
@@ -73,15 +58,20 @@ combined_chat <- one_chat |>
     text = str_squish(text),
     tangram = gsub("/experiment/tangram_", "", target, fixed = TRUE),
     tangram = gsub(".png", "", tangram, fixed = TRUE)
-  ) %>%
+  ) |> 
   select(gameId, trialNum, repNum, tangram, playerId, role, numPlayers, text, condition)
 # so here we instead count non-white space chunks for words
 
-one_round_results <- read_rds(str_c(url, "data/study1/round_results.rds")) %>% mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
-two_a_round_results <- read_rds(str_c(url, "data/study2a/round_results.rds")) %>% mutate(rotate = "no_rotate")
-two_b_round_results <- read_rds(str_c(url, "data/study2b/round_results.rds")) %>% mutate(rotate = "full_feedback")
-two_c_round_results <- read_rds(str_c(url, "data/study2c/round_results.rds")) |> mutate(rotate = "emoji")
-three_round_results <- read_rds(str_c(url, "data/study3/round_results.rds")) |> rename(`_id` = "X_id", condition = name)
+one_round_results <- read_rds(str_c(url, "data/study1/round_results.rds")) |> 
+  mutate(rotate = str_c(as.character(numPlayers), "_rotate"))
+two_a_round_results <- read_rds(str_c(url, "data/study2a/round_results.rds")) |> 
+  mutate(rotate = "no_rotate")
+two_b_round_results <- read_rds(str_c(url, "data/study2b/round_results.rds")) |> 
+  mutate(rotate = "full_feedback")
+two_c_round_results <- read_rds(str_c(url, "data/study2c/round_results.rds")) |> 
+  mutate(rotate = "emoji")
+three_round_results <- read_rds(str_c(url, "data/study3/round_results.rds")) |> 
+  rename(`_id` = "X_id", condition = name)
 
 combined_results <- one_round_results |>
   rbind(two_a_round_results) |>
@@ -95,8 +85,7 @@ combined_results <- one_round_results |>
 
 chat <- combined_chat |>
   left_join(combined_results) |>
-  
-  write_csv(here(dat_loc,"combined_chat.csv"))
+  write_csv(here(dat_loc, "combined_chat.csv"))
 ```
 
 # Main prep
@@ -105,20 +94,57 @@ chat <- combined_chat |>
 # Incremental
 
 ```{r}
-incremental <- chat |> filter(role=="speaker") |> select(gameId, trialNum, repNum, tangram, condition, text) |> group_by(gameId, trialNum, repNum, tangram, condition) |> 
-  summarize(text=str_c(text, collapse=" ")) |> 
-  rowwise() |> 
-  mutate(words=str_split(text, pattern="\\s+"), 
-         l=length(words),
-         r=list(seq(1,l,1))) |> 
-  unnest(r) |> 
-  rowwise() |> 
-  mutate(words=list(words[1:r]),
-         partial=words|> str_c(sep=" ", collapse=" ")) |> 
-  select(gameId, trialNum, repNum, tangram, condition, partial_length=r, partial, text) |>  write_csv(here(dat_loc, "incremental.csv"))
+incremental <- chat |>
+  filter(role == "speaker") |>
+  select(gameId, trialNum, repNum, tangram, condition, text) |>
+  group_by(gameId, trialNum, repNum, tangram, condition) |>
+  summarize(text = str_c(text, collapse = " ")) |>
+  rowwise() |>
+  mutate(
+    words = str_split(text, pattern = "\\s+"),
+    l = length(words),
+    r = list(seq(1, l, 1))
+  ) |>
+  unnest(r) |>
+  rowwise() |>
+  mutate(
+    words = list(words[1:r]),
+    partial = words |> str_c(sep = " ", collapse = " ")
+  ) |>
+  select(gameId, trialNum, repNum, tangram, condition, partial_length = r, partial, text) |>
+  write_csv(here(dat_loc, "incremental.csv"))
 ```
 
 
+# Rolling windows
 
+```{r}
+make_rolling_window <- function(text, window_size, is_negative = FALSE) {
+  words <- str_split_1(text, " ")
+  ctx_size <- (window_size - 1) / 2
+  slide(1:length(words), ~ {
+    if (is_negative) {
+      included <- words[-.x]
+    } else {
+      included <- words[.x]
+    }
+    paste(included, collapse = " ")
+  }, .before = ctx_size, .after = ctx_size)
+}
 
-
+rolling <- chat |>
+  filter(role == "speaker") |>
+  select(gameId, trialNum, repNum, tangram, condition, text) |>
+  group_by(gameId, trialNum, repNum, tangram, condition) |>
+  summarise(text = paste(text, collapse = " ")) |>
+  mutate(
+    pos_1 = map(text, make_rolling_window, window_size = 1, is_negative = FALSE),
+    pos_3 = map(text, make_rolling_window, window_size = 3, is_negative = FALSE),
+    pos_5 = map(text, make_rolling_window, window_size = 5, is_negative = FALSE),
+    neg_1 = map(text, make_rolling_window, window_size = 1, is_negative = TRUE),
+    neg_3 = map(text, make_rolling_window, window_size = 3, is_negative = TRUE),
+    neg_5 = map(text, make_rolling_window, window_size = 5, is_negative = TRUE),
+  ) |>
+  unnest(cols = c(starts_with("pos_"), starts_with("neg_")))
+write_csv(rolling, here(dat_loc, "rolling.csv"))
+```
