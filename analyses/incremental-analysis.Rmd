@@ -6,35 +6,15 @@ output:
     toc: TRUE
 ---
 
-
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = FALSE, warning = F, message = F)
 #knitr::opts_chunk$set(dev = "png", dev.args = list(type = "cairo-png"), fig.width = 10, fig.height = 4)
 options(knitr.table.format = "html")
 knitr::opts_chunk$set(echo = F)
 library(tidyverse)
-library(viridis)
-library(Replicate)
-library(metafor)
-library(esc)
 library(here)
-library(brms)
-library(rstan)
-library(googledrive)
-library(glmnet)
-library(tidybayes)
-library(ggstance)
-library("lattice")
-library(reshape2)
-library(ggrepel)
-library(ggthemes)
-library(knitr)
-library(cowplot)
-library(ggtext)
-rstan_options(auto_write = TRUE)
-options(mc.cores = parallel::detectCores())
-library(ggtext)
-library(ggridges)
+library(philentropy)
+library(slider)
 
 theme_set(theme_bw())
 
@@ -48,6 +28,15 @@ human <- read_csv(here(dat_loc, "human_data.csv")) # tg-matcher data
 source(here("analyses/helper.R"))
 ```
 
+```{r, eval=F}
+full_text <- read_csv(here("pre_model/incremental.csv")) |> 
+  group_by(gameId, trialNum, repNum, tangram, condition) |> 
+  arrange(desc(partial_length)) |> 
+  slice(1) |> 
+  rename(text = partial) |> 
+  select(-partial_length)
+```
+
 
 ```{r}
 mod_raw <- read_csv(here(prediction_loc, "incremental-probs.csv")) |>
@@ -55,7 +44,8 @@ mod_raw <- read_csv(here(prediction_loc, "incremental-probs.csv")) |>
   left_join(read_csv(here("pre_model/incremental.csv"))) |>
   select(-raw_logits) |>
   pivot_longer(p_A:p_L) |>
-  mutate(name = str_sub(name, 3))
+  mutate(name = str_sub(name, 3)) |> 
+  left_join(full_text)
 
 mod_pred <- mod_raw |>
   group_by(tangram, gameId, trialNum, repNum, partial, condition, partial_length, text) |>
@@ -165,6 +155,23 @@ kable(biggest |> head(100))
 ```
 
 I think final words are > average at diagnostic or content words? 
+
+# KL divergence
+```{r, message=F}
+mod_kl <- mod_raw |> 
+  pivot_wider(names_from = name,
+              values_from = value) |> 
+  group_by(tangram, gameId, trialNum, repNum, condition) |> 
+  nest(probs = A:L) |> 
+  mutate(kl = slide(probs, \(p) {
+    bind_rows(p) |> as.matrix() |> KL()
+  }, .before = 1, .complete = TRUE)) |> 
+  ungroup() |> 
+  mutate(kl = ifelse(map_lgl(kl, is.null), NA, kl) |> list_simplify()) |> 
+  select(-probs)
+```
+
+
 
 # Notes
 Plots we want:
