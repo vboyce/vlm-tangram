@@ -169,6 +169,24 @@ mod_kl <- mod_raw |>
   ungroup() |> 
   mutate(kl = ifelse(map_lgl(kl, is.null), NA, kl) |> list_simplify()) |> 
   select(-probs)
+
+mod_kl_first <- mod_raw |> 
+  pivot_wider(names_from = name,
+              values_from = value) |> 
+  filter(partial_length == 1) |> 
+  group_by(tangram, gameId, trialNum, repNum, condition) |> 
+  nest(probs = A:L) |> 
+  mutate(kl = map_dbl(probs, \(p) {
+    rbind(rep(1/12, times = 12), as.matrix(p)) |> KL()
+  })) |> 
+  select(-probs)
+
+mod_kl_full <- mod_kl |> 
+  left_join(mod_kl_first, 
+            by = join_by(tangram, gameId, trialNum, repNum, 
+                         condition, partial, partial_length, text)) |> 
+  mutate(kl = coalesce(kl.x, kl.y)) |> 
+  select(-kl.x, -kl.y)
 ```
 
 
